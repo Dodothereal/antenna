@@ -263,19 +263,31 @@ class ClassMaskingTask(BasePostProcessingTask):
         return algorithm
 
     def _scoped_classifications(
-        self, config: ClassMaskingConfig, source_algorithm: Algorithm
+        self, config: ClassMaskingConfig, source_algorithm: Algorithm, masking_algorithm: Algorithm
     ) -> tuple[QuerySet[Classification], str]:
         """Resolve the terminal classifications to re-score from the config's scope.
 
         ``config_schema`` guarantees exactly one scope id is set, so the single
         ``else`` branch is sound.
+
+        Sources already re-scored by ``masking_algorithm`` are excluded via the
+        ``applied_to`` lineage so the mask is idempotent: a source is masked at most
+        once per masking algorithm. This keeps re-runs safe — finishing a partially
+        completed run (e.g. one the health-check reaper revoked) processes only the
+        remainder, and a source that became terminal again (after a dedup or
+        re-classification pass) is not masked a second time. The guard is on the
+        lineage rather than the terminal flag, which is why it survives that churn.
         """
-        base = Classification.objects.filter(
-            terminal=True,
-            algorithm=source_algorithm,
-            scores__isnull=False,
-            logits__isnull=False,
-        ).select_related("detection", "detection__occurrence")
+        base = (
+            Classification.objects.filter(
+                terminal=True,
+                algorithm=source_algorithm,
+                scores__isnull=False,
+                logits__isnull=False,
+            )
+            .exclude(derived_classifications__algorithm=masking_algorithm)
+            .select_related("detection", "detection__occurrence")
+        )
 
         if config.occurrence_id is not None:
             if not Occurrence.objects.filter(pk=config.occurrence_id).exists():
@@ -312,7 +324,7 @@ class ClassMaskingTask(BasePostProcessingTask):
         masking_algorithm = self._get_or_create_masking_algorithm(
             source_algorithm, taxa_list, reweight=config.reweight
         )
-        classifications, scope_desc = self._scoped_classifications(config, source_algorithm)
+        classifications, scope_desc = self._scoped_classifications(config, source_algorithm, masking_algorithm)
         self.logger.info(f"Applying class masking on {scope_desc} using taxa list {taxa_list.pk}")
 
         def _on_batch(m: dict) -> None:
